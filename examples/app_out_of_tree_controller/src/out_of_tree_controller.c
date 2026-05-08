@@ -77,10 +77,6 @@ static float TRANS_KD_FIXED[] = {12.0f, 12.0f, 5.0f};
 static float ROT_KP_FIXED[] = {95.0f, 95.0f, 95.0f};
 static float ROT_KD_FIXED[] = {40.0f, 40.0f, 40.0f};
 
-static float kp_x;
-static float kp_y;
-static float kp_z;
-
 // Init store variables
 static float pos_error_stored[] = {0.0f, 0.0f, 0.0f};
 static float vel_error_stored[] = {0.0f, 0.0f, 0.0f};
@@ -90,7 +86,10 @@ static float orientation_error_stored[] = {0.0f, 0.0f, 0.0f, 0.0f};
 // static float angular_velocity_stored[] = {0.0f,0.0f,0.0f};
 static float angular_velocity_error_stored[] = {0.0f, 0.0f, 0.0f};
 static float stored_fth[] = {0.0f, 0.0f, 0.0f};
-static float stored_target[] = {0.0f, 0.0f, 0.0f};
+// static float stored_target[] = {0.0f, 0.0f, 0.0f};
+
+struct quat initial_orientation;
+bool recorded_initial_orientation;
 
 // Input variables
 static struct vec control_torque;
@@ -176,7 +175,11 @@ void controllerOutOfTree(control_t *control, const setpoint_t *setpoint,
                          const sensorData_t *sensors, const state_t *state,
                          const stabilizerStep_t stabilizerStep) {
   float omega[3] = {0};
-  float fth = 0;
+  //  float fth = 0;
+  float control_thrust = 0;
+  struct vec z_vec = mkvec(0, 0, 1);
+  //  struct vec unitz = mkvec(0, 0, 1);
+  struct quat z_q = mkquat(0, 0, 0, 1);
   omega[0] = radians(sensors->gyro.x);
   omega[1] = radians(sensors->gyro.y);
   omega[2] = radians(sensors->gyro.z);
@@ -192,6 +195,71 @@ void controllerOutOfTree(control_t *control, const setpoint_t *setpoint,
     struct vec posError = mkvec(state->position.x - setpoint->position.x,
                                 state->position.y - setpoint->position.y,
                                 state->position.z - setpoint->position.z);
+
+    pos_error_stored[0] = posError.x;
+    pos_error_stored[1] = posError.y;
+    pos_error_stored[2] = posError.z;
+
+    // Velocity error
+    struct vec velError = mkvec(state->velocity.x - setpoint->velocity.x,
+                                state->velocity.y - setpoint->velocity.y,
+                                state->velocity.z - setpoint->velocity.z);
+    vel_error_stored[0] = velError.x;
+    vel_error_stored[1] = velError.y;
+    vel_error_stored[2] = velError.z;
+    // Angular velocity from gyroscope
+
+    omega_stored[0] = omega[0];
+    omega_stored[1] = omega[1];
+    omega_stored[2] = omega[2];
+
+    // ----- Translational control ------
+
+    struct vec trans_kp_vec =
+        mkvec(TRANS_KP_FIXED[0], TRANS_KP_FIXED[1], TRANS_KP_FIXED[2]);
+    struct vec trans_kd_vec =
+        mkvec(TRANS_KD_FIXED[0], TRANS_KD_FIXED[1], TRANS_KD_FIXED[2]);
+
+    struct vec trans_control =
+        vadd(veltmul(trans_kp_vec, posError), veltmul(trans_kd_vec, velError));
+    trans_control.z -= GRAVITY_MAGNITUDE;
+    trans_control = vscl(-CF_MASS, trans_control);
+    float norm_trans_control = vmag(trans_control);
+    struct vec control_direction = vzero();
+
+    if (norm_trans_control != 0) {
+      // control_direction = vdiv(trans_control,norm_trans_control);
+      // trans_control = vscl(THRUST_MAX*tanhf(norm_trans_control/THRUST_MAX),
+      // control_direction);
+      control_direction = vdiv(trans_control, norm_trans_control);
+    }
+
+    struct quat curr_thrust_force_vectorq = qqmul(orientation, z_q);
+    curr_thrust_force_vectorq =
+        qqmul(curr_thrust_force_vectorq, qinv(orientation));
+    struct vec curr_thrust_force_vector =
+        mkvec(curr_thrust_force_vectorq.x, curr_thrust_force_vectorq.y,
+              curr_thrust_force_vectorq.z); // Fth
+    control_thrust =
+        trans_control.z / vdot(z_vec, curr_thrust_force_vector); // Fu
+
+    /*
+    // Current attitude
+    struct quat orientation =
+        mkquat(state->attitudeQuaternion.x, state->attitudeQuaternion.y,
+               state->attitudeQuaternion.z, state->attitudeQuaternion.w);
+    if (!recorded_initial_orientation) {
+      initial_orientation = orientation;
+      recorded_initial_orientation = true;
+    }
+
+    struct vec posError = mkvec(state->position.x - setpoint->position.x,
+                                state->position.y - setpoint->position.y,
+                                state->position.z - setpoint->position.z);
+    //    struct vec pos =
+    //        mkvec(state->position.x, state->position.y, state->position.z);
+    // pos = qvrot(initial_orientation, pos);
+    // struct vec posError = mkvec(pos.x - 4, pos.y - 0, pos.z - 2);
 
     stored_target[0] = setpoint->position.x;
     stored_target[1] = setpoint->position.y;
@@ -237,7 +305,14 @@ void controllerOutOfTree(control_t *control, const setpoint_t *setpoint,
     stored_fth[1] = ut.y;
     stored_fth[2] = ut.z;
 
-    struct vec unitz = mkvec(0, 0, 1);
+    struct quat curr_thrust_force_vectorq = qqmul(orientation, z_q);
+    curr_thrust_force_vectorq =
+        qqmul(curr_thrust_force_vectorq, qinv(orientation));
+    struct vec curr_thrust_force_vector =
+        mkvec(curr_thrust_force_vectorq.x, curr_thrust_force_vectorq.y,
+              curr_thrust_force_vectorq.z);                        // Fth
+    control_thrust = ut.z / vdot(unitz, curr_thrust_force_vector); // Fu
+
     float dot_temp = vdot(fu, unitz);
     struct vec vcross_temp = vcross(fu, unitz);
 
@@ -249,7 +324,7 @@ void controllerOutOfTree(control_t *control, const setpoint_t *setpoint,
 
     float real = sqrtf((1 + dot_temp) / 2);
 
-    struct quat qd = mkquat(real, -imaginary.x, -imaginary.y, -imaginary.z);
+    struct quat qd = mkquat(-imaginary.x, -imaginary.y, -imaginary.z, real);
     struct quat qz = mkquat(0, 0, 0, 1);
     struct quat qe = qnormalize(qqmul(qqmul(qinv(qz), qd), orientation));
     float theta = 2 * acosf(qe.w);
@@ -268,7 +343,6 @@ void controllerOutOfTree(control_t *control, const setpoint_t *setpoint,
 
     struct vec angVelocityVector = mkvec(omega[0], omega[1], omega[2]);
 
-    // Invert reference
     store_from_q(qd, orientation_stored);
     store_from_q(qe, orientation_error_stored);
 
@@ -288,12 +362,8 @@ void controllerOutOfTree(control_t *control, const setpoint_t *setpoint,
     control_torque = vadd(
         orientation_control,
         vcross(angVelocityVector, mvmul(CRAZYFLIE_INERTIA, angVelocityVector)));
+    */
   }
-
-  //  control->thrustSi = 0.0f;
-  //  control->torque[0] = 0.0f;
-  //  control->torque[1] = 0.0f;
-  //  control->torque[2] = 0.0f;
 
   // Control Input
   if (setpoint->mode.z == modeDisable) {
@@ -303,12 +373,13 @@ void controllerOutOfTree(control_t *control, const setpoint_t *setpoint,
     control->torque[2] = 0.0f;
   } else {
     // control the body torques
-    control->thrustSi = fth;
+    control->thrustSi = control_thrust;
     control->torqueX = control_torque.x;
     control->torqueY = control_torque.y;
     control->torqueZ = control_torque.z;
   }
 
+  //
   control->controlMode = controlModeForceTorque;
 }
 
