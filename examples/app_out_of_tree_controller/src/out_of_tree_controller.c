@@ -63,6 +63,8 @@ void appMain() {
 #include "platform_defaults.h"
 #include "stabilizer_types.h"
 
+static const float MU = 0.00f;
+
 const struct mat33 CRAZYFLIE_INERTIA = {{{16.6e-6f, 0.83e-6f, 0.72e-6f},
                                          {0.83e-6f, 16.6e-6f, 1.8e-6f},
                                          {0.72e-6f, 1.8e-6f, 29.3e-6f}}};
@@ -72,10 +74,17 @@ const struct mat33 CRAZYFLIE_INERTIA = {{{16.6e-6f, 0.83e-6f, 0.72e-6f},
 static const float ROTATION_MAX = 30;
 
 // const gains
-static float TRANS_KP_FIXED[] = {16.0f, 16.0f, 12.0f};
-static float TRANS_KD_FIXED[] = {12.0f, 12.0f, 5.0f};
-static float ROT_KP_FIXED[] = {95.0f, 95.0f, 95.0f};
-static float ROT_KD_FIXED[] = {40.0f, 40.0f, 40.0f};
+// Retuned for the SI force/torque (N, N*m) interpretation of
+// controlModeForceTorque. The original {16,16,12}/{12,12,5} translational and
+// {95,95,95}/{40,40,40} rotational gains command ~60g of force and ~160 N*m of
+// torque (vs the CF's ~0.01-0.03 N*m actuator limit), so the attitude loop
+// chatters against saturation and the vehicle tumbles. These values give proper
+// bandwidth separation (attitude ~30 rad/s, position ~2 rad/s) and converge
+// cleanly (verified in tools/matlab/simulate_controller_oot_convergence.m).
+static float TRANS_KP_FIXED[] = {0.11f, 0.11f, 0.11f};
+static float TRANS_KD_FIXED[] = {0.10f, 0.10f, 0.10f};
+static float ROT_KP_FIXED[] = {0.03f, 0.03f, 0.03f};
+static float ROT_KD_FIXED[] = {0.0008f, 0.0008f, 0.0008f};
 
 // Init store variables
 static float pos_error_stored[] = {0.0f, 0.0f, 0.0f};
@@ -164,6 +173,18 @@ static inline struct quat qexp(struct quat q) {
   return result;
 }
 
+static inline float absf(const float a) {
+  if (a < 0)
+    return -a;
+  return a;
+}
+
+static inline float dhnorm(float e, float ep, float max_e, float gamma2,
+                           float mu) {
+  return (1 / max_e) * (float)pow(absf(e), 1 / (1 - mu)) +
+         (float)(gamma2 * absf(ep));
+}
+
 void controllerOutOfTreeInit() { isInit = true; }
 
 bool controllerOutOfTreeTest() {
@@ -171,21 +192,21 @@ bool controllerOutOfTreeTest() {
   return true;
 }
 
+float control_thrust = 0;
+//  float fth = 0;
+
 void controllerOutOfTree(control_t *control, const setpoint_t *setpoint,
                          const sensorData_t *sensors, const state_t *state,
                          const stabilizerStep_t stabilizerStep) {
-  float omega[3] = {0};
-  //  float fth = 0;
-  float control_thrust = 0;
-  struct vec z_vec = mkvec(0, 0, 1);
-  //  struct vec unitz = mkvec(0, 0, 1);
-  struct quat z_q = mkquat(0, 0, 0, 1);
-  omega[0] = radians(sensors->gyro.x);
-  omega[1] = radians(sensors->gyro.y);
-  omega[2] = radians(sensors->gyro.z);
-
   if (RATE_DO_EXECUTE(ATTITUDE_RATE, stabilizerStep) ||
       RATE_DO_EXECUTE(POSITION_RATE, stabilizerStep)) {
+    struct vec omega = mkvec(0, 0, 0);
+    struct vec z_vec = mkvec(0, 0, 1);
+    struct quat z_q = mkquat(0, 0, 1, 0);
+
+    omega.x = radians(sensors->gyro.x);
+    omega.y = radians(sensors->gyro.y);
+    omega.z = radians(sensors->gyro.z);
 
     // Current attitude
     struct quat orientation =
@@ -209,9 +230,9 @@ void controllerOutOfTree(control_t *control, const setpoint_t *setpoint,
     vel_error_stored[2] = velError.z;
     // Angular velocity from gyroscope
 
-    omega_stored[0] = omega[0];
-    omega_stored[1] = omega[1];
-    omega_stored[2] = omega[2];
+    omega_stored[0] = omega.x;
+    omega_stored[1] = omega.y;
+    omega_stored[2] = omega.z;
 
     // ----- Translational control ------
 
@@ -220,149 +241,81 @@ void controllerOutOfTree(control_t *control, const setpoint_t *setpoint,
     struct vec trans_kd_vec =
         mkvec(TRANS_KD_FIXED[0], TRANS_KD_FIXED[1], TRANS_KD_FIXED[2]);
 
-    struct vec trans_control =
-        vadd(veltmul(trans_kp_vec, posError), veltmul(trans_kd_vec, velError));
-    trans_control.z -= GRAVITY_MAGNITUDE;
-    trans_control = vscl(-CF_MASS, trans_control);
-    float norm_trans_control = vmag(trans_control);
-    struct vec control_direction = vzero();
-
-    if (norm_trans_control != 0) {
-      // control_direction = vdiv(trans_control,norm_trans_control);
-      // trans_control = vscl(THRUST_MAX*tanhf(norm_trans_control/THRUST_MAX),
-      // control_direction);
-      control_direction = vdiv(trans_control, norm_trans_control);
+    struct vec fu = vadd(veltmul(vscl(-1, trans_kp_vec), posError),
+                         veltmul(vscl(-1, trans_kd_vec), velError));
+    struct vec ut = vdiv(fu, vmag(fu));
+    if (vmag(fu) > CF_MASS * GRAVITY_MAGNITUDE) {
+      fu = vscl(CF_MASS * GRAVITY_MAGNITUDE, ut);
     }
+
+    fu.z += ((CF_MASS+0.002f) * GRAVITY_MAGNITUDE);
+
+    stored_fth[0] = fu.x;
+    stored_fth[1] = fu.y;
+    stored_fth[2] = fu.z;
 
     struct quat curr_thrust_force_vectorq = qqmul(orientation, z_q);
     curr_thrust_force_vectorq =
         qqmul(curr_thrust_force_vectorq, qinv(orientation));
     struct vec curr_thrust_force_vector =
         mkvec(curr_thrust_force_vectorq.x, curr_thrust_force_vectorq.y,
-              curr_thrust_force_vectorq.z); // Fth
+              curr_thrust_force_vectorq.z); // Force direction
+    control_thrust = fu.z / vdot(z_vec, curr_thrust_force_vector); // Fu
     control_thrust =
-        trans_control.z / vdot(z_vec, curr_thrust_force_vector); // Fu
+        constrain(control_thrust, 0, CF_MASS * GRAVITY_MAGNITUDE * 1.5f);
 
-    /*
-    // Current attitude
-    struct quat orientation =
-        mkquat(state->attitudeQuaternion.x, state->attitudeQuaternion.y,
-               state->attitudeQuaternion.z, state->attitudeQuaternion.w);
-    if (!recorded_initial_orientation) {
-      initial_orientation = orientation;
-      recorded_initial_orientation = true;
-    }
-
-    struct vec posError = mkvec(state->position.x - setpoint->position.x,
-                                state->position.y - setpoint->position.y,
-                                state->position.z - setpoint->position.z);
-    //    struct vec pos =
-    //        mkvec(state->position.x, state->position.y, state->position.z);
-    // pos = qvrot(initial_orientation, pos);
-    // struct vec posError = mkvec(pos.x - 4, pos.y - 0, pos.z - 2);
-
-    stored_target[0] = setpoint->position.x;
-    stored_target[1] = setpoint->position.y;
-    stored_target[2] = setpoint->position.z;
-
-    pos_error_stored[0] = posError.x;
-    pos_error_stored[1] = posError.y;
-    pos_error_stored[2] = posError.z;
-
-    // Velocity error
-    struct vec velError = mkvec(state->velocity.x - setpoint->velocity.x,
-                                state->velocity.y - setpoint->velocity.y,
-                                state->velocity.z - setpoint->velocity.z);
-    vel_error_stored[0] = velError.x;
-    vel_error_stored[1] = velError.y;
-    vel_error_stored[2] = velError.z;
-    // Angular velocity from gyroscope
-
-    omega_stored[0] = omega[0];
-    omega_stored[1] = omega[1];
-    omega_stored[2] = omega[2];
-
-    kp_x = TRANS_KP_FIXED[0];
-    kp_y = TRANS_KP_FIXED[1];
-    kp_z = TRANS_KP_FIXED[2];
-
-    struct vec trans_kp_vec =
-        mkvec(TRANS_KP_FIXED[0], TRANS_KP_FIXED[1], TRANS_KP_FIXED[2]);
-    struct vec trans_kd_vec =
-        mkvec(TRANS_KD_FIXED[0], TRANS_KD_FIXED[1], TRANS_KD_FIXED[2]);
-    struct vec ut = vadd(veltmul(vneg(trans_kp_vec), posError),
-                         veltmul(vneg(trans_kd_vec), velError));
-    ut.z += GRAVITY_MAGNITUDE * CF_MASS;
-
-    fth = vmag(ut);
-    struct vec fu = vzero();
-
-    if (fth != 0) {
-      fu = vdiv(ut, fth);
-    }
-
-    stored_fth[0] = ut.x;
-    stored_fth[1] = ut.y;
-    stored_fth[2] = ut.z;
-
-    struct quat curr_thrust_force_vectorq = qqmul(orientation, z_q);
-    curr_thrust_force_vectorq =
-        qqmul(curr_thrust_force_vectorq, qinv(orientation));
-    struct vec curr_thrust_force_vector =
-        mkvec(curr_thrust_force_vectorq.x, curr_thrust_force_vectorq.y,
-              curr_thrust_force_vectorq.z);                        // Fth
-    control_thrust = ut.z / vdot(unitz, curr_thrust_force_vector); // Fu
-
-    float dot_temp = vdot(fu, unitz);
-    struct vec vcross_temp = vcross(fu, unitz);
-
+    ut = vdiv(fu, vmag(fu));
+    float dot = vdot(ut, z_vec);
+    struct vec cross = vcross(ut, z_vec);
     struct vec imaginary = mkvec(0, 0, 0);
-    float cross_mag = vmag(vcross_temp);
-    if (cross_mag != 0) {
-      imaginary = vscl(sqrtf((1 - dot_temp) / 2), vdiv(vcross_temp, cross_mag));
+    float real = 1;
+
+    if (vmag(cross) > 1e-12f) {
+      imaginary = vscl(sqrtf((1 - dot) / 2), vdiv(cross, vmag(cross)));
+      real = sqrtf((1 + dot) / 2);
     }
-
-    float real = sqrtf((1 + dot_temp) / 2);
-
     struct quat qd = mkquat(-imaginary.x, -imaginary.y, -imaginary.z, real);
-    struct quat qz = mkquat(0, 0, 0, 1);
-    struct quat qe = qnormalize(qqmul(qqmul(qinv(qz), qd), orientation));
+    qd = qnormalize(qd);
+    struct quat qe = qqmul(qinv(qd), orientation);
+    qe = qnormalize(qe);
     float theta = 2 * acosf(qe.w);
-    struct vec qrv = vscl(theta, mkvec(qe.x, qe.y, qe.z));
-    if (vmag(qrv) > M_PI_F) {
-      qd = qneg(qd);
-      qe = qnormalize(qqmul(qqmul(qinv(qz), qd), orientation));
+    if (theta != 0) {
+      struct vec qrv = vscl((theta / sinf(theta / 2)), mkvec(qe.x, qe.y, qe.z));
+      if (vmag(qrv) > M_PI_F) {
+        qd = qneg(qd);
+        qe = qqmul(qinv(qd), orientation);
+        qe = qnormalize(qe);
+      }
     }
-
-    struct vec orientationErrorVector = qlog(qd);
-
-    struct vec angVelocityErrorVector =
-        mkvec(omega[0] - setpoint->attitudeRate.pitch,
-              omega[1] - setpoint->attitudeRate.roll,
-              omega[2] - setpoint->attitudeRate.yaw);
-
-    struct vec angVelocityVector = mkvec(omega[0], omega[1], omega[2]);
-
     store_from_q(qd, orientation_stored);
     store_from_q(qe, orientation_error_stored);
 
-    struct vec rot_kp_vec =
+    struct vec rot_kp_vector =
         mkvec(ROT_KP_FIXED[0], ROT_KP_FIXED[1], ROT_KP_FIXED[2]);
-    struct vec rot_kd_vec =
+    struct vec rot_kd_vector =
         mkvec(ROT_KD_FIXED[0], ROT_KD_FIXED[1], ROT_KD_FIXED[2]);
 
-    angular_velocity_error_stored[0] = angVelocityErrorVector.x;
-    angular_velocity_error_stored[1] = angVelocityErrorVector.y;
-    angular_velocity_error_stored[2] = angVelocityErrorVector.z;
+    struct vec rotError = qlog(qe);
 
-    struct vec orientation_control =
-        vadd(veltmul(vneg(rot_kp_vec), orientationErrorVector),
-             veltmul(vneg(rot_kd_vec), angVelocityErrorVector));
-    // struct vec control_torque =
-    control_torque = vadd(
-        orientation_control,
-        vcross(angVelocityVector, mvmul(CRAZYFLIE_INERTIA, angVelocityVector)));
-    */
+    struct vec dh = mkvec(dhnorm(rotError.x, omega.x, M_PI_F, 0.5, MU),
+                          dhnorm(rotError.y, omega.y, M_PI_F, 0.5, MU),
+                          dhnorm(rotError.z, omega.z, M_PI_F, 0.5, MU));
+    struct vec dhprop = mkvec(dh.x > 1e-12f ? (float)pow(dh.x, 2 * MU) : 0,
+                              dh.y > 1e-12f ? (float)pow(dh.y, 2 * MU) : 0,
+                              dh.z > 1e-12f ? (float)pow(dh.z, 2 * MU) : 0);
+    struct vec dhdiff = mkvec(dh.x > 1e-12f ? (float)pow(dh.x, MU) : 0,
+                              dh.y > 1e-12f ? (float)pow(dh.y, MU) : 0,
+                              dh.z > 1e-12f ? (float)pow(dh.z, MU) : 0);
+
+    struct vec tau =
+        vadd(veltmul(vscl(-2, rot_kp_vector), veltmul(dhprop, rotError)),
+             veltmul(vscl(-1, rot_kd_vector), veltmul(dhdiff, omega)));
+    if (vmag(tau) > CF_MASS * 0.5f) {
+      tau = vscl(CF_MASS * 0.5f, vdiv(tau, vmag(tau)));
+    }
+    control_torque.x = tau.x;
+    control_torque.y = tau.y;
+    control_torque.z = tau.z;
   }
 
   // Control Input
@@ -373,10 +326,11 @@ void controllerOutOfTree(control_t *control, const setpoint_t *setpoint,
     control->torque[2] = 0.0f;
   } else {
     // control the body torques
+    //    control->thrustSi = control_thrust;
     control->thrustSi = control_thrust;
-    control->torqueX = control_torque.x;
-    control->torqueY = control_torque.y;
-    control->torqueZ = control_torque.z;
+    control->torqueX  = control_torque.x;
+    control->torqueY  = control_torque.y;
+    control->torqueZ  = control_torque.z;
   }
 
   //
@@ -411,13 +365,10 @@ LOG_ADD(LOG_FLOAT, vel_err_x, &vel_error_stored[0])
 LOG_ADD(LOG_FLOAT, vel_err_y, &vel_error_stored[1])
 LOG_ADD(LOG_FLOAT, vel_err_z, &vel_error_stored[2])
 
-LOG_ADD(LOG_FLOAT, fth_x, &stored_fth[0])
-LOG_ADD(LOG_FLOAT, fth_y, &stored_fth[1])
-LOG_ADD(LOG_FLOAT, fth_z, &stored_fth[2])
-
-// LOG_ADD(LOG_FLOAT, target_x, &stored_target[0])
-// LOG_ADD(LOG_FLOAT, target_y, &stored_target[1])
-// LOG_ADD(LOG_FLOAT, target_z, &stored_target[2])
+LOG_ADD(LOG_FLOAT, thrust, &control_thrust)
+LOG_ADD(LOG_FLOAT, torque_x, &control_torque.x)
+LOG_ADD(LOG_FLOAT, torque_y, &control_torque.y)
+LOG_ADD(LOG_FLOAT, torque_z, &control_torque.z)
 
 LOG_ADD(LOG_FLOAT, qd_x, &orientation_stored[0])
 LOG_ADD(LOG_FLOAT, qd_y, &orientation_stored[1])
