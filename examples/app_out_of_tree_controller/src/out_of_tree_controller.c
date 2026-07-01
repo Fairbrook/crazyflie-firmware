@@ -63,8 +63,6 @@ void appMain() {
 #include "platform_defaults.h"
 #include "stabilizer_types.h"
 
-static const float MU = 0.00f;
-
 const struct mat33 CRAZYFLIE_INERTIA = {{{16.6e-6f, 0.83e-6f, 0.72e-6f},
                                          {0.83e-6f, 16.6e-6f, 1.8e-6f},
                                          {0.72e-6f, 1.8e-6f, 29.3e-6f}}};
@@ -85,6 +83,10 @@ static float TRANS_KP_FIXED[] = {0.11f, 0.11f, 0.11f};
 static float TRANS_KD_FIXED[] = {0.10f, 0.10f, 0.10f};
 static float ROT_KP_FIXED[] = {0.03f, 0.03f, 0.03f};
 static float ROT_KD_FIXED[] = {0.0008f, 0.0008f, 0.0008f};
+
+static float MU = 0.0;
+static float EMAX = 1.0;
+static float GAMMA = 0.0;
 
 // Init store variables
 static float pos_error_stored[] = {0.0f, 0.0f, 0.0f};
@@ -179,10 +181,9 @@ static inline float absf(const float a) {
   return a;
 }
 
-static inline float dhnorm(float e, float ep, float max_e, float gamma2,
-                           float mu) {
-  return (1 / max_e) * (float)pow(absf(e), 1 / (1 - mu)) +
-         (float)(gamma2 * absf(ep));
+static inline float dhnorm(float e, float ep) {
+  return (1 / EMAX) * (float)pow(absf(e), 1 / (1 - MU)) +
+         (float)(GAMMA * absf(ep));
 }
 
 void controllerOutOfTreeInit() { isInit = true; }
@@ -248,7 +249,7 @@ void controllerOutOfTree(control_t *control, const setpoint_t *setpoint,
       fu = vscl(CF_MASS * GRAVITY_MAGNITUDE, ut);
     }
 
-    fu.z += ((CF_MASS+0.002f) * GRAVITY_MAGNITUDE);
+    fu.z += ((CF_MASS + 0.002f) * GRAVITY_MAGNITUDE);
 
     stored_fth[0] = fu.x;
     stored_fth[1] = fu.y;
@@ -297,9 +298,9 @@ void controllerOutOfTree(control_t *control, const setpoint_t *setpoint,
 
     struct vec rotError = qlog(qe);
 
-    struct vec dh = mkvec(dhnorm(rotError.x, omega.x, M_PI_F, 0.5, MU),
-                          dhnorm(rotError.y, omega.y, M_PI_F, 0.5, MU),
-                          dhnorm(rotError.z, omega.z, M_PI_F, 0.5, MU));
+    struct vec dh =
+        mkvec(dhnorm(rotError.x, omega.x), dhnorm(rotError.y, omega.y),
+              dhnorm(rotError.z, omega.z));
     struct vec dhprop = mkvec(dh.x > 1e-12f ? (float)pow(dh.x, 2 * MU) : 0,
                               dh.y > 1e-12f ? (float)pow(dh.y, 2 * MU) : 0,
                               dh.z > 1e-12f ? (float)pow(dh.z, 2 * MU) : 0);
@@ -328,9 +329,9 @@ void controllerOutOfTree(control_t *control, const setpoint_t *setpoint,
     // control the body torques
     //    control->thrustSi = control_thrust;
     control->thrustSi = control_thrust;
-    control->torqueX  = control_torque.x;
-    control->torqueY  = control_torque.y;
-    control->torqueZ  = control_torque.z;
+    control->torqueX = control_torque.x;
+    control->torqueY = control_torque.y;
+    control->torqueZ = control_torque.z;
   }
 
   //
@@ -354,6 +355,10 @@ PARAM_ADD(PARAM_FLOAT | PARAM_PERSISTENT, rot_kp_z, &ROT_KP_FIXED[2])
 PARAM_ADD(PARAM_FLOAT | PARAM_PERSISTENT, rot_kd_x, &ROT_KD_FIXED[0])
 PARAM_ADD(PARAM_FLOAT | PARAM_PERSISTENT, rot_kd_y, &ROT_KD_FIXED[1])
 PARAM_ADD(PARAM_FLOAT | PARAM_PERSISTENT, rot_kd_z, &ROT_KD_FIXED[2])
+
+PARAM_ADD(PARAM_FLOAT | PARAM_PERSISTENT, emax, &EMAX)
+PARAM_ADD(PARAM_FLOAT | PARAM_PERSISTENT, mu, &MU)
+PARAM_ADD(PARAM_FLOAT | PARAM_PERSISTENT, gamma, &GAMMA)
 PARAM_GROUP_STOP(ootParams)
 
 LOG_GROUP_START(oot)
