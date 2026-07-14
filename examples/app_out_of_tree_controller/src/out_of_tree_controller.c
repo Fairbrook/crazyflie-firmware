@@ -63,6 +63,8 @@ void appMain() {
 #include "platform_defaults.h"
 #include "stabilizer_types.h"
 
+#define I_MAX 0.5f
+
 const struct mat33 CRAZYFLIE_INERTIA = {{{16.6e-6f, 0.83e-6f, 0.72e-6f},
                                          {0.83e-6f, 16.6e-6f, 1.8e-6f},
                                          {0.72e-6f, 1.8e-6f, 29.3e-6f}}};
@@ -81,12 +83,18 @@ static const float ROTATION_MAX = 30;
 // cleanly (verified in tools/matlab/simulate_controller_oot_convergence.m).
 static float TRANS_KP_FIXED[] = {0.11f, 0.11f, 0.11f};
 static float TRANS_KD_FIXED[] = {0.10f, 0.10f, 0.10f};
+static float TRANS_KI_FIXED[] = {0.00f, 0.00f, 0.00f};
+static float TRANS_MU = 0.0;
+static float TRANS_EMAX = 1.0;
+static float TRANS_GAMMA = 0.0;
+
 static float ROT_KP_FIXED[] = {0.03f, 0.03f, 0.03f};
 static float ROT_KD_FIXED[] = {0.0008f, 0.0008f, 0.0008f};
+static float ROT_KI_FIXED[] = {0.0000f, 0.0000f, 0.0000f};
 
-static float MU = 0.0;
-static float EMAX = 1.0;
-static float GAMMA = 0.0;
+static float ROT_MU = 0.0;
+static float ROT_EMAX = 1.0;
+static float ROT_GAMMA = 0.0;
 
 // Init store variables
 static float pos_error_stored[] = {0.0f, 0.0f, 0.0f};
@@ -181,10 +189,20 @@ static inline float absf(const float a) {
   return a;
 }
 
-static inline float dhnorm(float e, float ep) {
-  return (1 / EMAX) * (float)pow(absf(e), 1 / (1 - MU)) +
-         (float)(GAMMA * absf(ep));
+static inline float rot_dhnorm(float e, float ep) {
+  return (1 / ROT_EMAX) * (float)powf(fabsf(e), 1 / (1 - ROT_MU)) +
+         (float)(ROT_GAMMA * fabsf(ep));
 }
+
+static inline float trans_dhnorm(float e, float ep) {
+  return (1 / TRANS_EMAX) * (float)powf(fabsf(e), 1 / (1 - TRANS_MU)) +
+         (float)(TRANS_GAMMA * fabsf(ep));
+}
+
+static struct vec omega = {.x = 0, .y = 0, .z = 0};
+static struct vec z_vec = {.x = 0, .y = 0, .z = 1};
+static struct quat z_q = {.x = 0, .y = 0, .z = 1, .w = 0};
+static struct quat orientation = {.x = 0, .y = 0, .z = 0, .w = 1};
 
 void controllerOutOfTreeInit() { isInit = true; }
 
@@ -194,25 +212,25 @@ bool controllerOutOfTreeTest() {
 }
 
 float control_thrust = 0;
-//  float fth = 0;
+
+static float trans_integrator[] = {0.0f, 0.0f, 0.0f};
+// static float attitude_integrator[] = {0.0f, 0.0f, 0.0f};
+//   float fth = 0;
 
 void controllerOutOfTree(control_t *control, const setpoint_t *setpoint,
                          const sensorData_t *sensors, const state_t *state,
                          const stabilizerStep_t stabilizerStep) {
   if (RATE_DO_EXECUTE(ATTITUDE_RATE, stabilizerStep) ||
       RATE_DO_EXECUTE(POSITION_RATE, stabilizerStep)) {
-    struct vec omega = mkvec(0, 0, 0);
-    struct vec z_vec = mkvec(0, 0, 1);
-    struct quat z_q = mkquat(0, 0, 1, 0);
-
-    omega.x = radians(sensors->gyro.x);
-    omega.y = radians(sensors->gyro.y);
-    omega.z = radians(sensors->gyro.z);
 
     // Current attitude
-    struct quat orientation =
-        mkquat(state->attitudeQuaternion.x, state->attitudeQuaternion.y,
-               state->attitudeQuaternion.z, state->attitudeQuaternion.w);
+    orientation.x = state->attitudeQuaternion.x;
+    orientation.y = state->attitudeQuaternion.y;
+    orientation.z = state->attitudeQuaternion.z;
+    orientation.w = state->attitudeQuaternion.w;
+  }
+
+  if (RATE_DO_EXECUTE(POSITION_RATE, stabilizerStep)) {
 
     struct vec posError = mkvec(state->position.x - setpoint->position.x,
                                 state->position.y - setpoint->position.y,
@@ -231,19 +249,62 @@ void controllerOutOfTree(control_t *control, const setpoint_t *setpoint,
     vel_error_stored[2] = velError.z;
     // Angular velocity from gyroscope
 
-    omega_stored[0] = omega.x;
-    omega_stored[1] = omega.y;
-    omega_stored[2] = omega.z;
-
     // ----- Translational control ------
 
     struct vec trans_kp_vec =
         mkvec(TRANS_KP_FIXED[0], TRANS_KP_FIXED[1], TRANS_KP_FIXED[2]);
     struct vec trans_kd_vec =
         mkvec(TRANS_KD_FIXED[0], TRANS_KD_FIXED[1], TRANS_KD_FIXED[2]);
+    struct vec trans_ki_vec =
+        mkvec(TRANS_KI_FIXED[0], TRANS_KI_FIXED[1], TRANS_KI_FIXED[2]);
 
-    struct vec fu = vadd(veltmul(vscl(-1, trans_kp_vec), posError),
-                         veltmul(vscl(-1, trans_kd_vec), velError));
+    struct vec trans_integrator_vec =
+        mkvec(trans_integrator[0], trans_integrator[1], trans_integrator[2]);
+
+    struct vec tdhprop = mkvec(1, 1, 1);
+    struct vec tdhdiff = mkvec(1, 1, 1);
+    struct vec tdhinte = mkvec(1, 1, 1);
+
+    if (fabsf(TRANS_MU) > 1e-9f) {
+      tdhprop = mkvec(0, 0, 0);
+      tdhdiff = mkvec(0, 0, 0);
+      tdhinte = mkvec(0, 0, 0);
+      struct vec tdh = mkvec(trans_dhnorm(posError.x, velError.x),
+                             trans_dhnorm(posError.y, velError.y),
+                             trans_dhnorm(posError.z, velError.z));
+      if (tdh.x > 1e-12f) {
+        tdhdiff.x = (float)powf(tdh.x, TRANS_MU);
+        tdhprop.x = (float)powf(tdh.x, 2 * TRANS_MU);
+        tdhinte.x = (float)powf(tdh.x, 3 * TRANS_MU);
+      }
+      if (tdh.y > 1e-12f) {
+        tdhdiff.y = (float)powf(tdh.y, TRANS_MU);
+        tdhprop.y = (float)powf(tdh.y, 2 * TRANS_MU);
+        tdhinte.y = (float)powf(tdh.y, 3 * TRANS_MU);
+      }
+      if (tdh.z > 1e-12f) {
+        tdhdiff.z = (float)powf(tdh.z, TRANS_MU);
+        tdhprop.z = (float)powf(tdh.z, 2 * TRANS_MU);
+        tdhinte.z = (float)powf(tdh.z, 3 * TRANS_MU);
+      }
+    }
+
+    trans_integrator_vec =
+        vadd(trans_integrator_vec,
+             vscl((float)(1.0f / POSITION_RATE), veltmul(tdhinte, posError)));
+
+    float imag = vmag(trans_integrator_vec);
+    if (imag > I_MAX) {
+      trans_integrator_vec = vscl(I_MAX / imag, trans_integrator_vec);
+    }
+    trans_integrator[0] = trans_integrator_vec.x;
+    trans_integrator[1] = trans_integrator_vec.y;
+    trans_integrator[2] = trans_integrator_vec.z;
+
+    struct vec fu =
+        vadd(veltmul(vscl(-1, trans_kp_vec), veltmul(tdhprop, posError)),
+             veltmul(vscl(-1, trans_kd_vec), veltmul(tdhdiff, velError)));
+    fu = vadd(fu, veltmul(vscl(-1, trans_ki_vec), trans_integrator_vec));
     struct vec ut = vdiv(fu, vmag(fu));
     if (vmag(fu) > CF_MASS * GRAVITY_MAGNITUDE) {
       fu = vscl(CF_MASS * GRAVITY_MAGNITUDE, ut);
@@ -264,8 +325,20 @@ void controllerOutOfTree(control_t *control, const setpoint_t *setpoint,
     control_thrust = fu.z / vdot(z_vec, curr_thrust_force_vector); // Fu
     control_thrust =
         constrain(control_thrust, 0, CF_MASS * GRAVITY_MAGNITUDE * 1.5f);
+  }
 
-    ut = vdiv(fu, vmag(fu));
+  if (RATE_DO_EXECUTE(ATTITUDE_RATE, stabilizerStep)) {
+    omega.x = radians(sensors->gyro.x);
+    omega.y = radians(sensors->gyro.y);
+    omega.z = radians(sensors->gyro.z);
+
+    omega_stored[0] = omega.x;
+    omega_stored[1] = omega.y;
+    omega_stored[2] = omega.z;
+
+    struct vec fu = mkvec(stored_fth[0], stored_fth[1], stored_fth[2]);
+    float fu_mag = vmag(fu);
+    struct vec ut = (fu_mag > 1e-9f) ? vdiv(fu, fu_mag) : z_vec;
     float dot = vdot(ut, z_vec);
     struct vec cross = vcross(ut, z_vec);
     struct vec imaginary = mkvec(0, 0, 0);
@@ -298,19 +371,37 @@ void controllerOutOfTree(control_t *control, const setpoint_t *setpoint,
 
     struct vec rotError = qlog(qe);
 
-    struct vec dh =
-        mkvec(dhnorm(rotError.x, omega.x), dhnorm(rotError.y, omega.y),
-              dhnorm(rotError.z, omega.z));
-    struct vec dhprop = mkvec(dh.x > 1e-12f ? (float)pow(dh.x, 2 * MU) : 0,
-                              dh.y > 1e-12f ? (float)pow(dh.y, 2 * MU) : 0,
-                              dh.z > 1e-12f ? (float)pow(dh.z, 2 * MU) : 0);
-    struct vec dhdiff = mkvec(dh.x > 1e-12f ? (float)pow(dh.x, MU) : 0,
-                              dh.y > 1e-12f ? (float)pow(dh.y, MU) : 0,
-                              dh.z > 1e-12f ? (float)pow(dh.z, MU) : 0);
+    struct vec rdhprop = mkvec(1, 1, 1);
+    struct vec rdhdiff = mkvec(1, 1, 1);
+    struct vec rdhinte = mkvec(1, 1, 1);
+
+    if (fabsf(ROT_MU) > 1e-9f) {
+      rdhprop = mkvec(0, 0, 0);
+      rdhdiff = mkvec(0, 0, 0);
+      rdhinte = mkvec(0, 0, 0);
+      struct vec rdh = mkvec(rot_dhnorm(rotError.x, omega.x),
+                             rot_dhnorm(rotError.y, omega.y),
+                             rot_dhnorm(rotError.z, omega.z));
+      if (rdh.x > 1e-12f) {
+        rdhdiff.x = (float)powf(rdh.x, ROT_MU);
+        rdhprop.x = (float)powf(rdh.x, 2 * ROT_MU);
+        rdhinte.x = (float)powf(rdh.x, 3 * ROT_MU);
+      }
+      if (rdh.y > 1e-12f) {
+        rdhdiff.y = (float)powf(rdh.y, ROT_MU);
+        rdhprop.y = (float)powf(rdh.y, 2 * ROT_MU);
+        rdhinte.y = (float)powf(rdh.y, 3 * ROT_MU);
+      }
+      if (rdh.z > 1e-12f) {
+        rdhdiff.z = (float)powf(rdh.z, ROT_MU);
+        rdhprop.z = (float)powf(rdh.z, 2 * ROT_MU);
+        rdhinte.z = (float)powf(rdh.z, 3 * ROT_MU);
+      }
+    }
 
     struct vec tau =
-        vadd(veltmul(vscl(-2, rot_kp_vector), veltmul(dhprop, rotError)),
-             veltmul(vscl(-1, rot_kd_vector), veltmul(dhdiff, omega)));
+        vadd(veltmul(vscl(-2, rot_kp_vector), veltmul(rdhprop, rotError)),
+             veltmul(vscl(-1, rot_kd_vector), veltmul(rdhdiff, omega)));
     if (vmag(tau) > CF_MASS * 0.5f) {
       tau = vscl(CF_MASS * 0.5f, vdiv(tau, vmag(tau)));
     }
@@ -325,6 +416,9 @@ void controllerOutOfTree(control_t *control, const setpoint_t *setpoint,
     control->torque[0] = 0.0f;
     control->torque[1] = 0.0f;
     control->torque[2] = 0.0f;
+    trans_integrator[0] = 0.0f;
+    trans_integrator[1] = 0.0f;
+    trans_integrator[2] = 0.0f;
   } else {
     // control the body torques
     //    control->thrustSi = control_thrust;
@@ -348,6 +442,14 @@ PARAM_ADD(PARAM_FLOAT | PARAM_PERSISTENT, trans_kd_x, &TRANS_KD_FIXED[0])
 PARAM_ADD(PARAM_FLOAT | PARAM_PERSISTENT, trans_kd_y, &TRANS_KD_FIXED[1])
 PARAM_ADD(PARAM_FLOAT | PARAM_PERSISTENT, trans_kd_z, &TRANS_KD_FIXED[2])
 
+PARAM_ADD(PARAM_FLOAT | PARAM_PERSISTENT, trans_ki_x, &TRANS_KI_FIXED[0])
+PARAM_ADD(PARAM_FLOAT | PARAM_PERSISTENT, trans_ki_y, &TRANS_KI_FIXED[1])
+PARAM_ADD(PARAM_FLOAT | PARAM_PERSISTENT, trans_ki_z, &TRANS_KI_FIXED[2])
+
+PARAM_ADD(PARAM_FLOAT | PARAM_PERSISTENT, trans_emax, &TRANS_EMAX)
+PARAM_ADD(PARAM_FLOAT | PARAM_PERSISTENT, trans_mu, &TRANS_MU)
+PARAM_ADD(PARAM_FLOAT | PARAM_PERSISTENT, trans_gamma, &TRANS_GAMMA)
+
 PARAM_ADD(PARAM_FLOAT | PARAM_PERSISTENT, rot_kp_x, &ROT_KP_FIXED[0])
 PARAM_ADD(PARAM_FLOAT | PARAM_PERSISTENT, rot_kp_y, &ROT_KP_FIXED[1])
 PARAM_ADD(PARAM_FLOAT | PARAM_PERSISTENT, rot_kp_z, &ROT_KP_FIXED[2])
@@ -356,9 +458,13 @@ PARAM_ADD(PARAM_FLOAT | PARAM_PERSISTENT, rot_kd_x, &ROT_KD_FIXED[0])
 PARAM_ADD(PARAM_FLOAT | PARAM_PERSISTENT, rot_kd_y, &ROT_KD_FIXED[1])
 PARAM_ADD(PARAM_FLOAT | PARAM_PERSISTENT, rot_kd_z, &ROT_KD_FIXED[2])
 
-PARAM_ADD(PARAM_FLOAT | PARAM_PERSISTENT, emax, &EMAX)
-PARAM_ADD(PARAM_FLOAT | PARAM_PERSISTENT, mu, &MU)
-PARAM_ADD(PARAM_FLOAT | PARAM_PERSISTENT, gamma, &GAMMA)
+PARAM_ADD(PARAM_FLOAT | PARAM_PERSISTENT, rot_ki_x, &ROT_KI_FIXED[0])
+PARAM_ADD(PARAM_FLOAT | PARAM_PERSISTENT, rot_ki_y, &ROT_KI_FIXED[1])
+PARAM_ADD(PARAM_FLOAT | PARAM_PERSISTENT, rot_ki_z, &ROT_KI_FIXED[2])
+
+PARAM_ADD(PARAM_FLOAT | PARAM_PERSISTENT, rot_emax, &ROT_EMAX)
+PARAM_ADD(PARAM_FLOAT | PARAM_PERSISTENT, rot_mu, &ROT_MU)
+PARAM_ADD(PARAM_FLOAT | PARAM_PERSISTENT, rot_gamma, &ROT_GAMMA)
 PARAM_GROUP_STOP(ootParams)
 
 LOG_GROUP_START(oot)
