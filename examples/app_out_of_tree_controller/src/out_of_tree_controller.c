@@ -349,7 +349,11 @@ void controllerOutOfTree(control_t *control, const setpoint_t *setpoint,
       real = sqrtf((1 + dot) / 2);
     }
     struct quat qd = mkquat(-imaginary.x, -imaginary.y, -imaginary.z, real);
+    float z_angle = radians(setpoint->attitude.yaw);
+    struct quat qz = mkquat(0, 0, sinf(z_angle), cosf(z_angle));
+    qd = qqmul(qinv(qz), qd);
     qd = qnormalize(qd);
+
     struct quat qe = qqmul(qinv(qd), orientation);
     qe = qnormalize(qe);
     float theta = 2 * acosf(qe.w);
