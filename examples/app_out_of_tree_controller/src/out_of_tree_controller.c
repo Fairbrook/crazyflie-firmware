@@ -226,7 +226,7 @@ void controllerOutOfTree(control_t *control, const setpoint_t *setpoint,
     // Current attitude
     orientation.x = state->attitudeQuaternion.x;
     orientation.y = state->attitudeQuaternion.y;
-    orientation.z = state->attitudeQuaternion.z;
+    orientation.z = -state->attitudeQuaternion.z;
     orientation.w = state->attitudeQuaternion.w;
   }
 
@@ -330,7 +330,7 @@ void controllerOutOfTree(control_t *control, const setpoint_t *setpoint,
   if (RATE_DO_EXECUTE(ATTITUDE_RATE, stabilizerStep)) {
     omega.x = radians(sensors->gyro.x);
     omega.y = radians(sensors->gyro.y);
-    omega.z = radians(sensors->gyro.z);
+    omega.z = radians(-sensors->gyro.z);
 
     omega_stored[0] = omega.x;
     omega_stored[1] = omega.y;
@@ -349,19 +349,35 @@ void controllerOutOfTree(control_t *control, const setpoint_t *setpoint,
       real = sqrtf((1 + dot) / 2);
     }
     struct quat qd = mkquat(-imaginary.x, -imaginary.y, -imaginary.z, real);
-    float z_angle = radians(setpoint->attitude.yaw);
-    struct quat qz = mkquat(0, 0, sinf(z_angle), cosf(z_angle));
-    qd = qqmul(qinv(qz), qd);
+
     qd = qnormalize(qd);
 
-    struct quat qe = qqmul(qinv(qd), orientation);
+    float desired_yaw;
+    if (setpoint->mode.yaw == modeVelocity) {
+      desired_yaw = -radians(state->attitude.yaw + setpoint->attitudeRate.yaw *
+                                                       (1.0f / ATTITUDE_RATE));
+    } else {
+      desired_yaw = -radians(setpoint->attitude.yaw);
+    }
+
+    // Half angle: mkquat(0, 0, sin(a), cos(a)) is a rotation of 2a about z.
+    float z_angle = desired_yaw / 2.0f;
+    struct quat qz = qnormalize(mkquat(0, 0, sinf(z_angle), cosf(z_angle)));
+
+    // math3d's qqmul(a, b) composes as R(b)*R(a), so this yields
+    // R_d = R_tilt * Rz(yaw): the yaw acts about the body z axis, leaving the
+    // commanded thrust direction untouched.
+
+    //    struct quat qe = qqmul(qqmul(qz, qinv(qd)), orientation);
+    qd = qqmul(qinv(qz), qinv(qd));
+    struct quat qe = qqmul(qd, orientation);
     qe = qnormalize(qe);
     float theta = 2 * acosf(qe.w);
     if (theta != 0) {
       struct vec qrv = vscl((theta / sinf(theta / 2)), mkvec(qe.x, qe.y, qe.z));
       if (vmag(qrv) > M_PI_F) {
         qd = qneg(qd);
-        qe = qqmul(qinv(qd), orientation);
+        qe = qqmul(qd, orientation);
         qe = qnormalize(qe);
       }
     }
@@ -411,7 +427,7 @@ void controllerOutOfTree(control_t *control, const setpoint_t *setpoint,
     }
     control_torque.x = tau.x;
     control_torque.y = tau.y;
-    control_torque.z = tau.z;
+    control_torque.z = -tau.z;
   }
 
   // Control Input
